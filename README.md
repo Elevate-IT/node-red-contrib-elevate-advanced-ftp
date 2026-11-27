@@ -59,6 +59,23 @@ You can modify paths, filenames, and other parameters dynamically via `msg` prop
 
 ---
 
+## 🔐 Connection settings, timeouts and FTPS
+
+| Setting | Default | Meaning |
+|---|---|---|
+| Connection Timeout | 10000 ms | TCP connect only. |
+| **Login Timeout** | 10000 ms | From connect until logged in: TCP connect, `220` greeting, TLS handshake, `USER`/`PASS`. On expiry the socket is destroyed and the operation fails with `err.code = 'ETIMEDOUT_READY'`. `0` disables it. |
+| **Operation Timeout** | 300000 ms | The operation after login (e.g. the full upload of a PUT). Fails with `err.code = 'ETIMEDOUT_OPERATION'`. `0` disables it. |
+| Explicit FTPS (AUTH TLS) | off | `AUTH TLS` on the control connection, `PROT P` for data connections. |
+| TLS Options | – | JSON object passed to `tls.connect()`, e.g. `{"rejectUnauthorized": false}` or `{"minVersion": "TLSv1.2"}`. |
+| **Allow legacy TLS renegotiation** | off | Needed for servers without RFC 5746 support, which Node.js 18+ rejects with `ERR_SSL_UNSAFE_LEGACY_RENEGOTIATION_DISABLED`. |
+
+The node calls `done()` when the operation has really finished (or failed), so Catch/Complete nodes and
+message timing reflect the real FTP work. Each message uses its own connection; `msg.abort = true`
+destroys the connections this node still has open.
+
+---
+
 ## 🧪 Example Flow
 
 Here's an example of how to use the FTP Client node to perform different FTP operations dynamically:
@@ -86,6 +103,16 @@ This project uses the following libraries:
 
 - [node-ftp](https://github.com/mscdex/node-ftp) – Asynchronous FTP client for Node.js.
 - [fs-extra](https://github.com/jprichardson/node-fs-extra) – File system utilities with promise support and enhancements.
+
+---
+
+## 🧪 Tests
+
+```bash
+npm test
+```
+
+Runs `test/harness.js` against local plain-FTP and explicit-FTPS servers (pyftpdlib), including a server that never sends its greeting and one that stalls after login. Needs Node.js, `openssl` and [uv](https://docs.astral.sh/uv/); uses ports 2121-2125 and 30000-30199 on 127.0.0.1.
 
 ---
 

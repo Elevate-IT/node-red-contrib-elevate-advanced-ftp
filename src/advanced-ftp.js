@@ -16,23 +16,31 @@
 
 module.exports = function (RED) {
     'use strict'
-    var ftp = require('ftp');
     var fs = require('fs')
+    var ftpSession = require('./lib/ftp-session');
+    var startSession = ftpSession.startSession;
+    var buildConnectOptions = ftpSession.buildConnectOptions;
 
     // Function for configuration
     function AdvancedFtpNode(n) {
         RED.nodes.createNode(this, n);
         var credentials = RED.nodes.getCredentials(n.id) || {};
+        var secureOptions = ftpSession.parseSecureOptions(n.secureOptions);
+        if (secureOptions.error) this.warn(secureOptions.error);
         this.options = {
             'host': n.host || 'localhost',
             'port': n.port || 21,
             'secure': n.secure || false,
-            'secureOptions': n.secureOptions,
+            'secureOptions': secureOptions.value,
+            'allowLegacyRenegotiation': n.allowLegacyRenegotiation === true,
             'user': n.user || 'anonymous',
             'password': credentials.password || 'anonymous@',
             'connTimeout': n.connTimeout || 10000,
             'pasvTimeout': n.pasvTimeout || 10000,
-            'keepalive': n.keepalive || 10000
+            'keepalive': n.keepalive || 10000,
+            // Older configs do not have these: defaults are applied in buildConnectOptions()
+            'readyTimeout': n.readyTimeout,
+            'operationTimeout': n.operationTimeout
         };
     }
 
@@ -62,6 +70,8 @@ module.exports = function (RED) {
         this.throwError = n.throwError;
         this.showError = n.showError;
         this.ftpConfig = RED.nodes.getNode(this.ftp);
+        // Sessions (one connection per message) that are still running
+        this.activeSessions = new Set();
 
         this.status({});
 
@@ -76,9 +86,6 @@ module.exports = function (RED) {
                 // If this is pre-1.0, 'send' will be undefined, so fallback to node.send
                 send = send || function () { node.send.apply(node, arguments) }
 
-                // Create a constructor for the FTP server
-                var conn = new ftp();
-                
                 // Allow the user to modify the options
                 var options = msg.options || node.ftpConfig.options;
 
@@ -172,623 +179,304 @@ module.exports = function (RED) {
                 // The msg.abort takes precedence over the abort set in the node
                 var abort = msg.abort;
 
-                this.abortCommand = function (err) {
-                    if (err) {
-                        if (done) {
-                            // Node-RED 1.0 compatible
-                            if (throwError) done(err);
-                        } else {
-                            // Node-RED 0.x compatible
-                            if (throwError) node.error(err, msg);
-                        }
-                        if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + ' Failed' });
-                        if (sendError) {
-                            msg.error = err;
-                            msg.payload = 'Operation Aborted';
-                            msg.success = false;
-                            send(msg);
-                        }
-                        return;
-                    }
-
-
-                    msg.payload = "Operation Aborted";
-                    msg.abort = abort;
-                    send(msg);
+                // Finish the handling of this message, exactly once
+                var completed = false;
+                function complete(err) {
+                    if (completed) return;
+                    completed = true;
                     if (done) {
-                        done();
+                        // Node-RED 1.0 compatible
+                        if (err && throwError) done(err); else done();
+                    } else if (err && throwError) {
+                        // Node-RED 0.x compatible
+                        node.error(err, msg);
                     }
-                    return;
                 }
 
                 if (abort !== undefined && abort === true) {
-                    conn.abort(node.abortCommand);
-                    node.status({ fill: 'blue', shape: 'ring', text: 'Aborted' });
-                } else {
-                    operation = operation.toLocaleLowerCase();
-
-                    // Manage operation when sent via a JSON object
-
-                    switch (operation) {
-                        case 'status':
-                            // Do nothing, does not require additional parameters
-                            break;
-                        case 'list':
-                            // Do nothing, does not require additional parameters
-                            break;
-                        case 'listsafe':
-                            // Do nothing, does not require additional parameters
-                            break;
-                        case 'lastmod':
-                            // Do nothing, does not require additional parameters
-                            break;
-                        case 'size':
-                            // Do nothing, does not require additional parameters
-                            break;
-                        case 'site':
-                            if (command === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase());
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        case 'get':
-                            if (filename === '' || localFilename === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase());
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        case 'append':
-                            if (filename === '' || localFilename === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase());
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        case 'put':
-                            if (filename === '' || localFilename === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase());
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        case 'rename':
-                            if (oldPath === '' || newPath === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase());
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        case 'mkdir':
-                            if (newPath === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase());
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        case 'rmdir':
-                            if (oldPath === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase());
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        case 'delete':
-                            if (filename === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase());
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        case 'pwd':
-                            // Do nothing, does not require additional parameters
-                            break;
-                        case 'system':
-                            // Do nothing, does not require additional parameters
-                            break;
-                        case 'putrename':
-                            if (filename === '' || localFilename === '' || newPath === '') {
-                                if (throwError) node.error("Invalid Parameters for " + operation.toLocaleUpperCase() + " : filename: " + filename + " localfilename:" + localFilename + " newPath:" + newPath);
-                                if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + " :Invalid Parameters" });
-                                if (sendError) {
-                                    msg.error = "Invalid Parameters for " + operation.toLocaleUpperCase();
-                                    msg.payload = 'Operation Aborted';
-                                    msg.success = false;
-                                    send(msg);
-                                }
-                                return;
-                            }
-                            break;
-                        default:
-                            if (throwError) node.error("Invalid Command");
-                            if (showError) node.status({ fill: 'red', shape: 'ring', text: "Invalid Operation" });
-                            if (sendError) {
-                                msg.error = "Invalid Command";
-                                msg.payload = 'Operation Aborted';
-                                msg.success = false;
-                                send(msg);
-                            }
-                            return;
-                    }
-
-                    // Display the status of the node
-                    node.status({ fill: 'yellow', shape: 'ring', text: operation.toLocaleUpperCase() + ' Operation: ' + options.host + ':' + options.port });
-
-                    // Messages for the GET, PUT, APPEND, DELETE, LIST functions
-                    this.sendMsg = function (err, result) {
-
-                        if (err) {
-                            if (done) {
-                                // Node-RED 1.0 compatible
-                                if (throwError) done(err);
-                            } else {
-                                // Node-RED 0.x compatible
-                                if (throwError) node.error(err, msg);
-                            }
-                            if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + ' Failed' });
-                            if (sendError) {
-                                msg.error = err;
-                                msg.payload = operation.toLocaleUpperCase() + ' Failed';
-                                msg.success = false;
-                                send(msg);
-                            }
-                            conn.end();
-                            return;
-                        }
-
-                        if (operation == 'get') {
-                            try {
-                                result.once('close', function () { conn.end(); });
-
-                                node.status({ fill: 'yellow', shape: 'dot', text: 'Pending...' });
-                                let writestream = fs.createWriteStream(localFilename);
-
-                                writestream.on('error', (err) => {
-                                    node.handleErrors(err);
-                                });
-
-                                result.on('end', function () {
-                                    node.status({ fill: 'green', shape: 'ring', text: 'GET Successful' });
-                                    msg.filename = filename;
-                                    msg.localFilename = localFilename;
-                                    msg.payload = 'GET operation successful. ' + localFilename;
-                                    node.send(msg);
-                                });
-
-                                result.pipe(writestream);
-
-                            } catch (err) {
-                                node.handleErrors(err);
-                            }
-                        } else if (operation == 'put') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'PUT Successful' });
-                            msg.filename = filename;
-                            msg.localFilename = localFilename;
-                            msg.payload = 'PUT operation successful.';
-                        } else if (operation == 'append') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'APPEND Successful' });
-                            msg.filename = filename;
-                            msg.localFilename = localFilename;
-                            msg.payload = 'APPEND operation successful.';
-                        } else if (operation == 'list' || operation == 'listsafe') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: operation.toLocaleUpperCase() + ' Successful' });
-                            msg.payload = result;
-                        } else if (operation == 'delete') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'DELETE Successful' });
-                            msg.filename = filename;
-                            msg.payload = result;
-                        }
-
-                        if (operation !== 'get') {
-                            send(msg);
-                        }
-                    };
-
-                    // Handle the error of the GET operation
-                    this.handleErrors = function (err) {
-
-                        node.status({ fill: 'red', shape: 'ring', text: 'Something went wrong...' });
-
-                        if (done) {
-
-                            // Node-RED 1.0 compatible
-
-                            if (throwError) done(err);
-
-                        } else {
-
-                            // Node-RED 0.x compatible
-
-                            if (throwError) node.error(err, msg);
-
-                        }
-
-                    }
-
-
-                    // Handle the status response
-                    this.sendStatus = function (err, result) {
-                        if (err) {
-                            if (done) {
-                                // Node-RED 1.0 compatible
-                                if (throwError) done(err);
-                            } else {
-                                // Node-RED 0.x compatible
-                                if (throwError) node.error(err, msg);
-                            }
-                            if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + ' Failed' });
-                            if (sendError) {
-                                msg.error = err;
-                                msg.payload = operation.toLocaleUpperCase() + ' Failed';
-                                msg.success = false;
-                                send(msg);
-                            }
-                            conn.end();
-                            return;
-                        }
-
-                        if (operation == 'status') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'STATUS Successful' });
-                        } else if (operation == 'pwd') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'PWD Successful' });
-                        } else if (operation == 'system') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'SYSTEM Successful' });
-                        }
-                        msg.payload = result;
-                        send(msg);
-                    };
-
-                    // Handle the paths for operations like rename, mkdir, rmdir
-                    this.sendPaths = function (err) {
-                        if (err) {
-                            if (done) {
-                                // Node-RED 1.0 compatible
-                                if (throwError) done(err);
-                            } else {
-                                // Node-RED 0.x compatible
-                                if (throwError) node.error(err, msg);
-                            }
-                            if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + ' Failed' });
-                            if (sendError) {
-                                msg.error = err;
-                                msg.payload = operation.toLocaleUpperCase() + ' Failed';
-                                msg.success = false;
-                                send(msg);
-                            }
-                            conn.end();
-                            return;
-                        }
-
-                        if (operation == 'rename') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'RENAME Successful' });
-                            msg.payload = 'RENAME operation successful.';
-                            msg.oldPath = oldPath;
-                            msg.newPath = newPath;
-                        }
-
-                        if (operation == 'mkdir') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'MKDIR Successful' });
-                            msg.payload = 'MKDIR operation successful.';
-                            msg.path = newPath;
-                        }
-
-                        if (operation == 'rmdir') {
-                            conn.end();
-                            node.status({ fill: 'green', shape: 'ring', text: 'RMDIR Successful' });
-                            msg.payload = 'RMDIR operation successful.';
-                            msg.path = oldPath;
-                        }
-
-                        send(msg);
-                    };
-
-                    // Set the data type
-                    this.setDataType = function (err) {
-                        if (err) {
-                            if (done) {
-                                // Node-RED 1.0 compatible
-                                if (throwError) done(err);
-                            } else {
-                                // Node-RED 0.x compatible
-                                if (throwError) node.error(err, msg);
-                            }
-                            if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + ' Failed' });
-                            if (sendError) {
-                                msg.error = err;
-                                msg.payload = operation.toLocaleUpperCase() + ' Failed';
-                                msg.success = false;
-                                send(msg);
-                            }
-                            conn.end();
-                            return;
-                        }
-
-                    };
-
-                    // Handle the last modified date
-                    this.lastModified = function (err, date) {
-                        if (err) {
-                            if (done) {
-                                // Node-RED 1.0 compatible
-                                if (throwError) done(err);
-                            } else {
-                                // Node-RED 0.x compatible
-                                if (throwError) node.error(err, msg);
-                            }
-                            if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + ' Failed' });
-                            if (sendError) {
-                                msg.error = err;
-                                msg.payload = operation.toLocaleUpperCase() + ' Failed';
-                                msg.success = false;
-                                send(msg);
-                            }
-                            conn.end();
-                            return;
-                        }
-
-                        conn.end();
-
-                        node.status({ fill: 'green', shape: 'ring', text: 'LASTMOD Successful' });
-
-                        msg.path = oldPath;
-                        msg.payload = Date.parse(date);
-                        send(msg);
-                    };
-
-                    // Handle the size of a file
-                    this.getSize = function (err, bytes) {
-                        if (err) {
-                            if (done) {
-                                // Node-RED 1.0 compatible
-                                if (throwError) done(err);
-                            } else {
-                                // Node-RED 0.x compatible
-                                if (throwError) node.error(err, msg);
-                            }
-                            if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + ' Failed' });
-                            if (sendError) {
-                                msg.error = err;
-                                msg.payload = operation.toLocaleUpperCase() + ' Failed';
-                                msg.success = false;
-                                send(msg);
-                            }
-                            conn.end();
-                            return;
-                        }
-
-                        conn.end();
-
-                        node.status({ fill: 'green', shape: 'ring', text: 'SIZE Successful' });
-
-                        msg.path = oldPath;
-                        msg.payload = bytes;
-                        send(msg);
-                    };
-
-                    // Handle the SITE command
-                    this.siteCommand = function (err, response, result) {
-                        if (err) {
-                            if (done) {
-                                // Node-RED 1.0 compatible
-                                if (throwError) done(err);
-                            } else {
-                                // Node-RED 0.x compatible
-                                if (throwError) node.error(err, msg);
-                            }
-                            if (showError) node.status({ fill: 'red', shape: 'ring', text: operation.toLocaleUpperCase() + ' Failed' });
-                            if (sendError) {
-                                msg.error = err;
-                                msg.payload = operation.toLocaleUpperCase() + ' Failed';
-                                msg.success = false;
-                                send(msg);
-                            }
-                            conn.end();
-                            return;
-                        }
-
-                        node.status({ fill: 'green', shape: 'ring', text: 'SITE ' + command + ' Successful' });
-
-                        msg.payload = response;
-                        msg.responseCode = result;
-                        send(msg);
-                    };
-
-                    conn.on('ready', function () {
-
-                        if (dataType !== 'binary') {
-                            conn.ascii(node.setDataType);
-                        }
-
-                        msg.operation = operation;
-                        msg.dataType = dataType;
-
-                        switch (operation) {
-                            case 'status':
-                                conn.status(node.sendStatus);
-                                break;
-                            case 'list':
-                                if (workingDir != '') {
-                                    if (workingDir.startsWith('./')) {
-                                        conn.list(workingDir, useCompression, node.sendMsg);
-                                    } else {
-                                        conn.list('./' + workingDir, useCompression, node.sendMsg);
-                                    }
-                                } else {
-                                    conn.list('./', useCompression, node.sendMsg);
-                                }
-                                break;
-                            case 'listsafe':
-                                if (workingDir != '') {
-                                    if (workingDir.startsWith('./')) {
-                                        conn.listSafe(workingDir,useCompression, node.sendMsg);
-                                    } else {
-                                        conn.listSafe('./' + workingDir, useCompression, node.sendMsg);
-                                    }
-                                } else {
-                                    conn.listSafe('./', useCompression, node.sendMsg);
-                                }
-                                break;
-                            case 'get':
-                                conn.get(filename, useCompression, node.sendMsg);
-                                break;
-                            case 'append':
-                                conn.append(localFilename, filename, useCompression, node.sendMsg);
-                                break;
-                            case 'put':
-                                conn.put(localFilename, filename, useCompression, node.sendMsg);
-                                break;
-                            case 'rename':
-                                conn.rename(oldPath, newPath, node.sendPaths);
-                                break;
-                            case 'mkdir':
-                                conn.mkdir(newPath, recursive, node.sendPaths);
-                                break;
-                            case 'rmdir':
-                                conn.rmdir(oldPath, recursive, node.sendPaths);
-                                break;
-                            case 'delete':
-                                conn.delete(filename, node.sendMsg);
-                                break;
-                            case 'pwd':
-                                conn.pwd(node.sendStatus);
-                                break;
-                            case 'system':
-                                conn.system(node.sendStatus);
-                                break;
-                            case 'lastmod':
-                                conn.lastMod(oldPath, node.lastModified);
-                                break;
-                            case 'size':
-                                conn.size(oldPath, node.getSize);
-                                break;
-                            case 'site':
-                                conn.site(command, node.siteCommand);
-                                break;
-                            case 'putrename':                               
-                                conn.put(localFilename, filename, useCompression, function (err) {
-                                    if (err) {
-                                        if (throwError) node.error(err, msg);
-                                        if (showError) node.status({ fill: 'red', shape: 'ring', text: 'PUT Failed' });
-                                        // Handle the error for PUT operation
-                                        if (sendError) {
-                                            msg.error = err;
-                                            msg.payload = 'PUT operation failed.';
-                                            msg.success = false;
-                                            send(msg);
-                                        }
-                                        conn.end();
-                                        return;
-                                    }
-                            
-                                    // Proceed with rename only after put is successful
-                                    conn.rename(filename, newPath, function (err) {
-                                        if (err) {
-                                            if (throwError) node.error(err, msg);
-                                            if (showError) node.status({ fill: 'red', shape: 'ring', text: 'RENAME Failed' });
-                                            // Handle the error for RENAME operation
-                                            if (sendError) {
-                                                msg.error = err;
-                                                msg.payload = 'RENAME operation failed.';
-                                                msg.success = false;
-                                                send(msg);
-                                            }
-                                            conn.end();                                            
-                                            return;
-                                        }
-                            
-                                        conn.end();
-                                        node.status({ fill: 'green', shape: 'ring', text: 'PUTRENAME Successful' });
-                                        msg.payload = 'PUTRENAME operation successful.';
-                                        msg.success = true;
-                                        msg.filename = filename;
-                                        msg.localFilename = localFilename;
-                                        msg.newPath = newPath;
-                                        send(msg);
-                                    });
-                                });
-                                break;
-                        }
+                    // Every message uses its own connection, so aborting means
+                    // tearing down the operations this node still has running.
+                    node.activeSessions.forEach(function (session) {
+                        var err = new Error('Operation aborted');
+                        err.code = 'EABORTED';
+                        session.finish(err);
                     });
+                    node.status({ fill: 'blue', shape: 'ring', text: 'Aborted' });
+                    msg.payload = 'Operation Aborted';
+                    msg.abort = abort;
+                    send(msg);
+                    complete();
+                    return;
                 }
 
-                // The connection to the server encountered an error
-                conn.on('error', function (err) {
-                    if (throwError) node.error(err, msg);
-                    if (showError) node.status({ fill: 'red', shape: 'ring', text: err.message });
+                operation = operation.toLocaleLowerCase();
+
+                // Validate the parameters required by the operation
+                function invalid(errorText) {
+                    if (throwError) node.error(errorText);
+                    if (showError) node.status({ fill: 'red', shape: 'ring', text: (operation ? operation.toLocaleUpperCase() + ' :Invalid Parameters' : 'Invalid Operation') });
                     if (sendError) {
-                        msg.error = err;
-                        msg.payload = 'Connection Error';
+                        msg.error = errorText;
+                        msg.payload = 'Operation Aborted';
                         msg.success = false;
                         send(msg);
                     }
-                    return;
-                });
-
-
-                conn.connect(options);
-
-                if (done) {
-                    done();
+                    complete();
                 }
 
+                var invalidParams = 'Invalid Parameters for ' + operation.toLocaleUpperCase();
+                switch (operation) {
+                    case 'status':
+                    case 'list':
+                    case 'listsafe':
+                    case 'lastmod':
+                    case 'size':
+                    case 'pwd':
+                    case 'system':
+                        // Do nothing, does not require additional parameters
+                        break;
+                    case 'site':
+                        if (command === '') return invalid(invalidParams);
+                        break;
+                    case 'get':
+                    case 'append':
+                    case 'put':
+                        if (filename === '' || localFilename === '') return invalid(invalidParams);
+                        break;
+                    case 'rename':
+                        if (oldPath === '' || newPath === '') return invalid(invalidParams);
+                        break;
+                    case 'mkdir':
+                        if (newPath === '') return invalid(invalidParams);
+                        break;
+                    case 'rmdir':
+                        if (oldPath === '') return invalid(invalidParams);
+                        break;
+                    case 'delete':
+                        if (filename === '') return invalid(invalidParams);
+                        break;
+                    case 'putrename':
+                        if (filename === '' || localFilename === '' || newPath === '') {
+                            return invalid(invalidParams + ' : filename: ' + filename + ' localfilename:' + localFilename + ' newPath:' + newPath);
+                        }
+                        break;
+                    default:
+                        operation = '';
+                        return invalid('Invalid Command');
+                }
+
+                var built = buildConnectOptions(options);
+                if (built.warning) node.warn(built.warning);
+                options = built.options;
+
+                // Display the status of the node
+                node.status({ fill: 'yellow', shape: 'ring', text: operation.toLocaleUpperCase() + ' Operation: ' + options.host + ':' + options.port });
+
+                var OP = operation.toLocaleUpperCase();
+                var isReady = false;
+                var failure = null; // labels for an error reported by an operation callback
+                var session;
+
+                // An operation callback failed: close the connection, then report
+                function opFailed(err, statusText, payloadText) {
+                    failure = { status: statusText, payload: payloadText };
+                    session.finish(err || new Error(OP + ' Failed'));
+                }
+
+                // The operation is complete: close the connection, then send msg
+                function succeed(statusText) {
+                    node.status({ fill: 'green', shape: 'ring', text: statusText || (OP + ' Successful') });
+                    msg.success = true;
+                    session.finish();
+                }
+
+                function onFinish(err) {
+                    node.activeSessions.delete(session);
+                    if (!err) {
+                        send(msg);
+                        complete();
+                        return;
+                    }
+                    var statusText, payloadText;
+                    if (failure) {
+                        statusText = failure.status || (OP + ' Failed');
+                        payloadText = failure.payload || (OP + ' Failed');
+                    } else if (!isReady) {
+                        statusText = err.message;
+                        payloadText = 'Connection Error';
+                    } else {
+                        statusText = OP + ' Failed: ' + err.message;
+                        payloadText = OP + ' Failed';
+                    }
+                    if (showError) node.status({ fill: 'red', shape: 'ring', text: statusText });
+                    if (sendError) {
+                        msg.error = err;
+                        msg.payload = payloadText;
+                        msg.success = false;
+                        send(msg);
+                    }
+                    complete(err);
+                }
+
+                function onReady(conn) {
+                    isReady = true;
+
+                    if (dataType !== 'binary') {
+                        conn.ascii(function (err) {
+                            if (err) opFailed(err);
+                        });
+                    }
+
+                    msg.operation = operation;
+                    msg.dataType = dataType;
+
+                    var listDir = './';
+                    if (workingDir != '') {
+                        listDir = workingDir.startsWith('./') ? workingDir : './' + workingDir;
+                    }
+
+                    switch (operation) {
+                        case 'status':
+                        case 'pwd':
+                        case 'system':
+                            conn[operation](function (err, result) {
+                                if (err) return opFailed(err);
+                                msg.payload = result;
+                                succeed();
+                            });
+                            break;
+                        case 'list':
+                        case 'listsafe':
+                            conn[operation === 'list' ? 'list' : 'listSafe'](listDir, useCompression, function (err, result) {
+                                if (err) return opFailed(err);
+                                msg.payload = result;
+                                succeed();
+                            });
+                            break;
+                        case 'get':
+                            conn.get(filename, useCompression, function (err, stream) {
+                                if (err) return opFailed(err);
+                                node.status({ fill: 'yellow', shape: 'dot', text: 'Pending...' });
+                                var writestream;
+                                try {
+                                    writestream = fs.createWriteStream(localFilename);
+                                } catch (e) {
+                                    return opFailed(e, 'Something went wrong...');
+                                }
+                                writestream.on('error', function (e) {
+                                    stream.unpipe(writestream);
+                                    opFailed(e, 'Something went wrong...');
+                                });
+                                stream.on('error', function (e) {
+                                    writestream.destroy();
+                                    opFailed(e);
+                                });
+                                // 'finish': everything has been flushed to the local file
+                                writestream.on('finish', function () {
+                                    msg.filename = filename;
+                                    msg.localFilename = localFilename;
+                                    msg.payload = 'GET operation successful. ' + localFilename;
+                                    succeed('GET Successful');
+                                });
+                                stream.pipe(writestream);
+                            });
+                            break;
+                        case 'put':
+                        case 'append':
+                            conn[operation](localFilename, filename, useCompression, function (err) {
+                                if (err) return opFailed(err);
+                                msg.filename = filename;
+                                msg.localFilename = localFilename;
+                                msg.payload = OP + ' operation successful.';
+                                succeed();
+                            });
+                            break;
+                        case 'rename':
+                            conn.rename(oldPath, newPath, function (err) {
+                                if (err) return opFailed(err);
+                                msg.payload = 'RENAME operation successful.';
+                                msg.oldPath = oldPath;
+                                msg.newPath = newPath;
+                                succeed();
+                            });
+                            break;
+                        case 'mkdir':
+                            conn.mkdir(newPath, recursive, function (err) {
+                                if (err) return opFailed(err);
+                                msg.payload = 'MKDIR operation successful.';
+                                msg.path = newPath;
+                                succeed();
+                            });
+                            break;
+                        case 'rmdir':
+                            conn.rmdir(oldPath, recursive, function (err) {
+                                if (err) return opFailed(err);
+                                msg.payload = 'RMDIR operation successful.';
+                                msg.path = oldPath;
+                                succeed();
+                            });
+                            break;
+                        case 'delete':
+                            conn.delete(filename, function (err, result) {
+                                if (err) return opFailed(err);
+                                msg.filename = filename;
+                                msg.payload = result;
+                                succeed();
+                            });
+                            break;
+                        case 'lastmod':
+                            conn.lastMod(oldPath, function (err, date) {
+                                if (err) return opFailed(err);
+                                msg.path = oldPath;
+                                msg.payload = Date.parse(date);
+                                succeed('LASTMOD Successful');
+                            });
+                            break;
+                        case 'size':
+                            conn.size(oldPath, function (err, bytes) {
+                                if (err) return opFailed(err);
+                                msg.path = oldPath;
+                                msg.payload = bytes;
+                                succeed();
+                            });
+                            break;
+                        case 'site':
+                            conn.site(command, function (err, response, code) {
+                                if (err) return opFailed(err);
+                                msg.payload = response;
+                                msg.responseCode = code;
+                                succeed('SITE ' + command + ' Successful');
+                            });
+                            break;
+                        case 'putrename':
+                            conn.put(localFilename, filename, useCompression, function (err) {
+                                if (err) return opFailed(err, 'PUT Failed', 'PUT operation failed.');
+                                // Proceed with rename only after put is successful
+                                conn.rename(filename, newPath, function (err) {
+                                    if (err) return opFailed(err, 'RENAME Failed', 'RENAME operation failed.');
+                                    msg.payload = 'PUTRENAME operation successful.';
+                                    msg.filename = filename;
+                                    msg.localFilename = localFilename;
+                                    msg.newPath = newPath;
+                                    succeed();
+                                });
+                            });
+                            break;
+                    }
+                }
+
+                session = startSession({ options: options, onReady: onReady, onFinish: onFinish });
+                if (!completed) node.activeSessions.add(session);
+            });
+
+            // Do not leave connections behind on redeploy/shutdown
+            node.on('close', function () {
+                node.activeSessions.forEach(function (session) {
+                    var err = new Error('Node closed');
+                    err.code = 'ECLOSED';
+                    session.finish(err);
+                });
+                node.activeSessions.clear();
             });
         } else {
             // Missing Advanced FTP configuration
