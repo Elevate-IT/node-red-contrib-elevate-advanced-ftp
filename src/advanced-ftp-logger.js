@@ -16,7 +16,7 @@
 
 module.exports = function (RED) {
     'use strict'
-    var ftp = require('ftp');
+    var ftpSession = require('./lib/ftp-session');
     var fs = require('fs-extra');
 
     //Funzione del nodo
@@ -35,6 +35,8 @@ module.exports = function (RED) {
         this.throwError = n.throwError
         this.showError = n.showError;
         this.ftpConfig = RED.nodes.getNode(this.ftp);
+        // Sessions (one connection per message) that are still running
+        this.activeSessions = new Set();
 
         this.status({});
 
@@ -44,7 +46,18 @@ module.exports = function (RED) {
             node.on('input', function (msg, send, done) {
 
                 //Crea un costruttore per il server ftp
-                var conn = new ftp();
+                var conn;
+
+                // done() must be called exactly once, when the connection is over
+                if (done) {
+                    var nodeRedDone = done;
+                    var doneCalled = false;
+                    done = function (err) {
+                        if (doneCalled) return;
+                        doneCalled = true;
+                        if (err) nodeRedDone(err); else nodeRedDone();
+                    };
+                }
 
                 // Permetti all'utente di motificare le opzioni
                 var options = msg.options || node.ftpConfig.options;
@@ -502,7 +515,7 @@ module.exports = function (RED) {
                 //#region CONNESSIONE AL SERVER FTP
 
                 //Il Server FTP è collegato e funzionante
-                conn.on('ready', function () {
+                function onReady() {
 
                     //#region VERIFICA LA PRESENZA DEI FILE
                     //Verifica la presenza del file locale
@@ -741,33 +754,45 @@ module.exports = function (RED) {
                     //Fai la lista di tutti i file presenti nella cartella FTP
 
 
-                });
-
-                //La connessione al server ha riscontrato un errore
-                conn.on('error', function (err) {
-                    if (throwError) node.error(err, msg);
-                    if (showError) node.status({ fill: 'red', shape: 'ring', text: err.message });
-                    return;
-                });
-
-                //La connessione al server ha riscontrato un errore
-                conn.on('close', function (err) {
-                    if (err) {
-                        if (throwError) node.error(err, msg);
-                        if (showError) node.status({ fill: 'red', shape: 'ring', text: err.message });
-                        return;
-                    }
-                    node.status({ fill: 'green', shape: 'ring', text: "Closed" });
-                    return;
-
-                });
+                }
 
                 //Connetti il Server FTP
-                conn.connect(options);
+                var built = ftpSession.buildConnectOptions(options);
+                if (built.warning) node.warn(built.warning);
+                var session = ftpSession.startSession({
+                    options: built.options,
+                    // The logger code does not always end the connection itself:
+                    // close it once no command is waiting for a reply any more.
+                    finishWhenIdle: true,
+                    onReady: onReady,
+                    onFinish: function (err) {
+                        node.activeSessions.delete(session);
+                        if (err) {
+                            if (showError) node.status({ fill: 'red', shape: 'ring', text: err.message });
+                            if (done) {
+                                if (throwError) done(err); else done();
+                            } else if (throwError) {
+                                node.error(err, msg);
+                            }
+                            return;
+                        }
+                        node.status({ fill: 'green', shape: 'ring', text: "Closed" });
+                        if (done) done();
+                    }
+                });
+                conn = session.conn;
+                node.activeSessions.add(session);
                 //#endregion
-                if (done) {
-                    done();
-                }
+            });
+
+            // Do not leave connections behind on redeploy/shutdown
+            node.on('close', function () {
+                node.activeSessions.forEach(function (session) {
+                    var err = new Error('Node closed');
+                    err.code = 'ECLOSED';
+                    session.finish(err);
+                });
+                node.activeSessions.clear();
             });
         }
         else {

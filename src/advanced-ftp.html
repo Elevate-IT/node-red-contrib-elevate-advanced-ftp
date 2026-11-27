@@ -42,10 +42,24 @@ limitations under the License.
     <input type="text" id="node-config-input-keepalive" placeholder="10000">
   </div>
   <div class="form-row">
-    <label for="node-config-input-secure"><i class="fa fa-key"></i> Data connection encryption</label>
-    <input type="checkbox" id="node-config-input-secure" placeholder="once" style="width: 10%; vertical-align: top;">
-    <label for="node-config-input-secureOptions" style="width: 20%; vertical-align: top;"> Secure Options</label>
-    <input type="text" id="node-config-input-secureOptions" style="width: 35%; vertical-align: top;">
+    <label for="node-config-input-readyTimeout"><i class="fa fa-clock-o"></i> Login Timeout</label>
+    <input type="text" id="node-config-input-readyTimeout" placeholder="10000">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-operationTimeout"><i class="fa fa-clock-o"></i> Operation Timeout</label>
+    <input type="text" id="node-config-input-operationTimeout" placeholder="300000">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-secure"><i class="fa fa-key"></i> Explicit FTPS (AUTH TLS)</label>
+    <input type="checkbox" id="node-config-input-secure" style="width: auto; vertical-align: top;">
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-secureOptions"><i class="fa fa-cog"></i> TLS Options</label>
+    <input type="text" id="node-config-input-secureOptions" placeholder='JSON, e.g. {"rejectUnauthorized": false}'>
+  </div>
+  <div class="form-row">
+    <label for="node-config-input-allowLegacyRenegotiation" style="width: auto;"><i class="fa fa-unlock"></i> Allow legacy TLS renegotiation</label>
+    <input type="checkbox" id="node-config-input-allowLegacyRenegotiation" style="width: auto; vertical-align: top; margin-left: 10px;">
   </div>
   <div class="form-row">
     <label for="node-config-input-name"><i class="fa fa-tag"></i> Name</label>
@@ -63,8 +77,11 @@ limitations under the License.
   <p><code>Connection Timeout</code>  is the time in milliseconds that the FTP client will try to connect to a server. Default: <code>10000</code></p>
   <p><code>PASV Timeout</code>is the time in milliseconds to wait for a PASV data connection to be established. Default: <code>10000</code></p>
   <p><code>Keepalive</code> is the time in milliseconds to send a 'dummy' (NOOP) command to keep the connection alive. Default: <code>10000</code></p>
-  <p><code>Data connection encryption</code> is set to true for both control and data connection encryption. Default: <code>false</code></p>
-  <p><code>Secure Options</code> is an additional options to be passed to tls.connect(). Default: (none)</p>
+  <p><code>Login Timeout</code> is the time in milliseconds allowed from opening the connection until the client is logged in: TCP connect, the server greeting (220), the TLS handshake and the login. If it expires the connection is destroyed and the operation fails with code <code>ETIMEDOUT_READY</code>. <code>0</code> disables it. Default: <code>10000</code></p>
+  <p><code>Operation Timeout</code> is the time in milliseconds allowed for the operation itself, after login (e.g. the whole upload of a PUT). If it expires the connection is destroyed and the operation fails with code <code>ETIMEDOUT_OPERATION</code>. <code>0</code> disables it. Default: <code>300000</code> (5 minutes)</p>
+  <p><code>Explicit FTPS (AUTH TLS)</code> upgrades the control connection with <code>AUTH TLS</code> and encrypts the data connections too (<code>PROT P</code>). Default: <code>false</code></p>
+  <p><code>TLS Options</code> is a JSON object with additional options passed to <code>tls.connect()</code>, for example <code>{"rejectUnauthorized": false}</code> or <code>{"minVersion": "TLSv1.2", "ciphers": "AES256-SHA"}</code>. Anything that is not a JSON object is ignored with a warning. Default: (none)</p>
+  <p><code>Allow legacy TLS renegotiation</code> allows servers that do not support RFC 5746 secure renegotiation. Node.js 18+ (OpenSSL 3) rejects those with <code>ERR_SSL_UNSAFE_LEGACY_RENEGOTIATION_DISABLED</code>. Only enable it for servers that need it. Default: <code>false</code></p>
 </script>
 
 <script type="text/x-red" data-help-name="advanced-ftp">
@@ -398,11 +415,25 @@ limitations under the License.
       host: { value: '' },
       port: { value: '' },
       secure: { value: false },
-      secureOptions: { value: '' },
+      secureOptions: {
+        value: '',
+        validate: function (v) {
+          if (v === undefined || v === null || String(v).trim() === '') return true;
+          try {
+            var o = JSON.parse(v);
+            return !!o && typeof o === 'object' && !Array.isArray(o);
+          } catch (e) {
+            return false;
+          }
+        }
+      },
+      allowLegacyRenegotiation: { value: false },
       user: { value: '' },
       connTimeout: { value: '' },
       pasvTimeout: { value: '' },
       keepalive: { value: '' },
+      readyTimeout: { value: '', validate: function (v) { return v === undefined || v === '' || /^\d+$/.test(String(v).trim()); } },
+      operationTimeout: { value: '', validate: function (v) { return v === undefined || v === '' || /^\d+$/.test(String(v).trim()); } },
       name : {value: ''}
     },
     credentials: {
